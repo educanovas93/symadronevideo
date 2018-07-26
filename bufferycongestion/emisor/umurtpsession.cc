@@ -1,0 +1,123 @@
+#include "umurtpsession.h"
+#include <math.h>
+
+UMURTPSession::UMURTPSession(bool emisor) : RTPSession() {
+  this->emisor = emisor;
+  peerId = 0;
+  new_rtcp = false;
+  closed = false;
+  fichero = fopen("out.dat", "wb");
+  fputs("# Time - Lost --- RTT ---- bitrate TCP --- threshold\n", fichero);
+  gettimeofday(&iniTime,NULL);
+  iniTime.tv_sec -= 5;
+  average_lost = 0;
+  first_time = true;
+}
+
+uint32_t UMURTPSession::getPeerSSRC() {
+  return peerId;
+}
+
+bool UMURTPSession::isClosed() {
+  return closed;
+}
+
+void UMURTPSession::OnNewSource(RTPSourceData *dat) {
+  if (peerId != 0) return; // Ya tengo un peer seleccionado
+  if (this->GetLocalSSRC() == 0) return; // Es el anuncio propio
+  printf("Peer detectado: %u\n", dat->GetSSRC());
+  peerId = dat->GetSSRC();
+  if (!emisor) {
+    // Añadir peer a la lista de destinos de la sesión para RTCP
+    this->AddDestination(*(dat->GetRTPDataAddress()));
+  }
+}
+
+void UMURTPSession::OnBYEPacket(RTPSourceData *dat) {
+  if (peerId == dat->GetSSRC()) {
+    printf("Peer cerrado: %u\n", dat->GetSSRC());
+    closed = true;
+    fclose(fichero);
+    peerId == 0;
+  }
+}
+
+double UMURTPSession::timeval_diff(struct timeval *a, struct timeval *b){
+  return
+    (double)(a->tv_sec + (double)a->tv_usec/1000000) -
+    (double)(b->tv_sec + (double)b->tv_usec/1000000);
+}
+
+uint32_t UMURTPSession::getRTPFriendlyRate(uint32_t bitrate_max, uint64_t time_inicio) {
+  uint32_t new_bitrate;
+  uint32_t bitrate_tcp;
+  uint32_t increment;
+  uint32_t mtu = 1500*8;
+  uint64_t t0 = time_inicio;
+
+  if(first_time) {
+    bitrate_act = threshold = bitrate_max;
+    first_time = false;
+  }
+  
+  if(peerId == 0) return bitrate_max;
+
+  RTPSourceData *data = this->GetSourceInfo(peerId);
+  gettimeofday(&endTime,NULL);
+  double time = timeval_diff(&endTime,&iniTime);
+  double fraction_lost, RTT;
+
+  if(new_rtcp){
+    fraction_lost = data->RR_GetFractionLost();
+    RTT = data->INF_GetRoundtripTime().GetDouble();
+    //printf("FractionLost: %f; RTT: %f; diff: %f\n", fraction_lost, RTT, time);
+    new_rtcp = false;
+  
+    if(time >= 5.0) {
+      average_lost = (0.7*average_lost)+(0.3*fraction_lost);
+      //printf("Average Lost = %f\n", average_lost); 
+      if(average_lost <= 0.01){
+	bitrate_tcp = bitrate_max;
+      } else {
+	if (RTT == 0 || average_lost == 0) bitrate_tcp = bitrate_max;
+	else {
+	  uint32_t br_tcp = (uint32_t)(1.22*mtu)/(RTT*sqrt(average_lost));
+	  bitrate_tcp = std::min(br_tcp, bitrate_max);
+	}
+      }
+    
+      if(average_lost >= 0.16) {
+	threshold = (3.0/4.0)*bitrate_act;
+	new_bitrate = bitrate_act/2.0;
+	gettimeofday(&iniTime,NULL);
+      } else {
+	if(bitrate_act < threshold)
+	  increment = (1.0/4.0)*bitrate_act;
+	else
+	  increment = 1500*8;
+
+	new_bitrate = std::min(bitrate_act+increment, bitrate_tcp);
+
+	if(new_bitrate < bitrate_act)
+	  threshold = (3.0/4.0)*bitrate_act;
+      }
+      uint64_t tiempo_act = clock();
+      double time = ((double)(tiempo_act-time_inicio))/CLOCKS_PER_SEC;
+
+
+      printf("%.6f %.6f %.6f %6u %u %u\n", time, average_lost, RTT, new_bitrate, bitrate_tcp, threshold);
+      fprintf(fichero, "%.6f %.6f %.6f %6u %u %u\n", time, average_lost, RTT, new_bitrate, bitrate_tcp, threshold);
+
+      bitrate_act = new_bitrate;
+      return new_bitrate;
+    }
+  } else
+    return bitrate_act;
+}
+
+void UMURTPSession::OnRTPPacket(RTPPacket *pack, const RTPTime &receivetime, const RTPAddress *senderaddress) {
+}
+
+void UMURTPSession::OnRTCPCompoundPacket(RTCPCompoundPacket *pack, const RTPTime &receivetime, const RTPAddress *senderaddress) {
+  new_rtcp = true;
+}
